@@ -115,7 +115,7 @@ class Trainer(DefaultTrainer):
             return combined_data_loader
 
     @classmethod
-    def build_test_loader(cls, cfg, dataset_name, dataset_type):
+    def build_test_loader(cls, cfg, dataset_name, dataset_type='video_instance'):
         mapper_dict = {
             'video_instance': YTVISDatasetMapper,
             'video_panoptic': PanopticDatasetVideoMapper,
@@ -256,7 +256,7 @@ class Trainer(DefaultTrainer):
                     )
                     results[dataset_name] = {}
                     continue
-            with autocast():
+            with torch.amp.autocast("cuda"):
                 results_i = inference_on_dataset(model, data_loader, evaluator)
             results[dataset_name] = results_i
             if comm.is_main_process():
