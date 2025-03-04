@@ -581,6 +581,38 @@ class DVIS_online(MinVIS):
             "task": cfg.MODEL.MASK_FORMER.TEST.TASK,
         }
 
+    def online_preprocess(self, images):
+        images = [(x.to(self.device) - self.pixel_mean) / self.pixel_std for x in images]
+        images = ImageList.from_tensors(images, self.size_divisibility)
+
+        return images
+
+    def online_inference(self, image, old_output):
+        image = self.online_preprocess(image)
+        image = image.tensor
+
+        import time
+
+        start = time.time()
+        features = self.backbone(image)
+        
+        end = time.time()
+        outputs = self.sem_seg_head(features)
+
+        end1 = time.time()
+        frame_embds   = outputs['pred_embds'][0]
+        mask_features = outputs['mask_features'].unsqueeze(0)
+        output = self.tracker.forward_frame(frame_embds, mask_features, old_output)
+        end2 = time.time()
+
+        print("=====================================")
+        print("backbone time:", end - start)
+        print("sem_seg_head time:", end1 - end)
+        print("tracker time:", end2 - end1)
+        print("total time:", end2 - start)
+
+        return output
+
     def forward(self, batched_inputs):
         """
         Args:
@@ -630,6 +662,8 @@ class DVIS_online(MinVIS):
                 images.append(frame.to(self.device))
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
+
+        self.window_inference = False
 
         if not self.training and self.window_inference:
             outputs = self.run_window_inference(images.tensor, window_size=self.window_size)
@@ -803,7 +837,7 @@ class DVIS_online(MinVIS):
             labels_per_image = labels[topk_indices]
             topk_indices = topk_indices // self.sem_seg_head.num_classes
             pred_masks = pred_masks[topk_indices]
-            pred_ids = pred_id[topk_indices]
+            pred_ids = pred_id[topk_indices.cpu()]
 
             # interpolation to original image size
             pred_masks = F.interpolate(

@@ -150,6 +150,78 @@ class ReferringTracker(torch.nn.Module):
         self.last_outputs = None
         return
 
+    def forward_decoder_layer(self, j, identity, tgt, memory):
+        output = self.transformer_cross_attention_layers[j](
+            identity, tgt, memory,
+            memory_mask=None,
+            memory_key_padding_mask=None,
+            pos=None, query_pos=None
+        )
+        output = self.transformer_self_attention_layers[j](
+            output, tgt_mask=None,
+            tgt_key_padding_mask=None,
+            query_pos=None
+        )
+        # FFN
+        output = self.transformer_ffn_layers[j](
+            output
+        )
+
+        return output
+
+    def forward_frame(self, cur_frame_embeds, mask_features, last_outputs=None):
+        # the first frame of a video
+        if last_outputs is None:
+            pre_frame_embeds = cur_frame_embeds
+            ret_indices = [self.match_embds(pre_frame_embeds, cur_frame_embeds)]
+            ms_output   = [cur_frame_embeds]
+            print(ms_output[-1].shape, cur_frame_embeds.shape)
+            for j in range(self.num_layers):
+                output = self.forward_decoder_layer(j, ms_output[-1], ms_output[-1], cur_frame_embeds)
+                ms_output.append(output)
+            pre_frame_embeds = cur_frame_embeds[ret_indices[-1]]
+        else:
+            pre_frame_embeds = last_outputs['pred_embeds']
+            pre_tgt = last_outputs['tgts'][-1]
+            ret_indices = [self.match_embds(pre_frame_embeds, cur_frame_embeds)]
+            ms_output   = [cur_frame_embeds[ret_indices[-1]]]
+            for j in range(self.num_layers):
+                output = self.forward_decoder_layer(j, ms_output[-1], pre_tgt, cur_frame_embeds)
+                ms_output.append(output)
+            pre_frame_embeds = cur_frame_embeds[ret_indices[-1]]
+
+        ms_output = ms_output[1:]
+        ms_output = torch.stack(ms_output, dim=0)
+
+        output_class, output_mask = self.prediction(ms_output[None], mask_features)
+
+        return {
+            'pred_logits': output_class[-1],  # (b, 1, q, c)
+            'pred_masks':  output_mask[-1],   # (b, q, 1, h, w)
+            'tgts':  ms_output, # (l, q, b, c)
+            'pred_embeds': pre_frame_embeds
+        }
+
+    def forward_frames(self, frame_embeds, mask_features):
+        outputs = [None]
+        for i in range(n_frame):
+            output = self.forward_frame(frame_embeds[i], mask_features, last_outputs=outputs[-1])
+            outputs.append(output)
+        outputs = outputs[1:]
+
+        outputs = torch.stack([x['tgts'] for x in outputs])
+        outputs_class, outputs_masks = self.prediction(outputs, mask_features)
+        outputs = self.decoder_norm(outputs)
+
+        return {
+            'pred_logits': outputs_class[-1],  # (b, t, q, c)
+            'pred_masks':  outputs_masks[-1],  # (b, q, t, h, w)
+            'aux_outputs': self._set_aux_loss(
+                outputs_class, outputs_masks
+            ),
+            'pred_embeds': outputs[:, -1].permute(2, 3, 0, 1)  # (b, c, t, q)
+        }
+
     def forward(self, frame_embeds, mask_features, resume=False, return_indices=False):
         """
         :param frame_embeds: the instance queries output by the segmenter
@@ -158,7 +230,6 @@ class ReferringTracker(torch.nn.Module):
         :param return_indices: whether return the match indices
         :return: output dict, including masks, classes, embeds.
         """
-        frame_embeds = frame_embeds.permute(2, 3, 0, 1)  # t, q, b, c
         n_frame, n_q, bs, _ = frame_embeds.size()
         outputs = []
         ret_indices = []
@@ -254,8 +325,8 @@ class ReferringTracker(torch.nn.Module):
         outputs_class, outputs_masks = self.prediction(outputs, mask_features)
         outputs = self.decoder_norm(outputs)
         out = {
-           'pred_logits': outputs_class[-1].transpose(1, 2),  # (b, t, q, c)
-           'pred_masks': outputs_masks[-1],  # (b, q, t, h, w)
+           'pred_logits': outputs_class[-1],  # (b, t, q, c)
+           'pred_masks':  outputs_masks[-1],  # (b, q, t, h, w)
            'aux_outputs': self._set_aux_loss(
                outputs_class, outputs_masks
            ),
@@ -286,7 +357,7 @@ class ReferringTracker(torch.nn.Module):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{"pred_logits": a.transpose(1, 2), "pred_masks": b}
+        return [{"pred_logits": a, "pred_masks": b}
                 for a, b in zip(outputs_class[:-1], outputs_seg_masks[:-1])
                 ]
 
@@ -295,9 +366,9 @@ class ReferringTracker(torch.nn.Module):
         # mask_features (b, t, c, h, w)
         decoder_output = self.decoder_norm(outputs)
         decoder_output = decoder_output.permute(1, 3, 0, 2, 4)  # (l, b, t, q, c)
-        outputs_class = self.class_embed(decoder_output).transpose(2, 3)  # (l, b, q, t, cls+1)
-        mask_embed = self.mask_embed(decoder_output)
-        outputs_mask = torch.einsum("lbtqc,btchw->lbqthw", mask_embed, mask_features)
+        outputs_class  = self.class_embed(decoder_output)  # (l, b, t, q, cls+1)
+        mask_embed     = self.mask_embed(decoder_output)
+        outputs_mask   = torch.einsum("lbtqc,btchw->lbqthw", mask_embed, mask_features)
         return outputs_class, outputs_mask
 
     def frame_forward(self, frame_embeds):
